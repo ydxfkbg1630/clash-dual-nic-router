@@ -3,6 +3,11 @@ param(
     [string]$DomesticInterface,
     [string]$OverseasInterface,
     [string]$PreferredProxy = '',
+    [ValidateSet('preserve', 'replace')][string]$RuleMode = 'preserve',
+    [ValidateSet('ipv4', 'dual', 'ipv6', 'ipv4-prefer', 'ipv6-prefer')][string]$ProxyIpVersion = 'ipv4',
+    [string[]]$ExtraDirectDomains = @(),
+    [string[]]$ExtraDirectCidrs = @(),
+    [switch]$SkipNetworkDiscovery,
     [string]$ConfigDirectory = (Join-Path $env:APPDATA 'io.github.clash-verge-rev.clash-verge-rev'),
     [string]$StateDirectory = (Join-Path $env:LOCALAPPDATA 'clash-dual-nic-router'),
     [switch]$Install,
@@ -24,7 +29,35 @@ foreach ($name in @($DomesticInterface, $OverseasInterface)) {
 }
 $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'split-routing.js'
 $text = [IO.File]::ReadAllText($source)
-$options = [ordered]@{ domesticInterface=$DomesticInterface; overseasInterface=$OverseasInterface; preferredProxy=$PreferredProxy; tun=$true; extraDirectCidrs=@() }
+# Keep the domestic adapter's DNS and gateways reachable outside TUN, including
+# campus DNS or authentication gateways with public addresses. Portal domains
+# and other portal addresses are supplied explicitly by the user.
+$directCidrs = @($ExtraDirectCidrs)
+if (-not $SkipNetworkDiscovery) {
+    $dnsAddresses = @(Get-DnsClientServerAddress -InterfaceAlias $DomesticInterface | ForEach-Object { $_.ServerAddresses })
+    $network = Get-NetIPConfiguration -InterfaceAlias $DomesticInterface
+    $gatewayAddresses = @($network.IPv4DefaultGateway.NextHop) + @($network.IPv6DefaultGateway.NextHop)
+    foreach ($address in @($dnsAddresses) + @($gatewayAddresses)) {
+        if ([string]::IsNullOrWhiteSpace($address)) { continue }
+        $ip = $null
+        # CIDRs contain addresses without an adapter's IPv6 scope identifier.
+        if (-not [Net.IPAddress]::TryParse(($address -split '%')[0], [ref]$ip)) { throw "Invalid discovered DNS or gateway address: $address" }
+        if ($ip.Equals([Net.IPAddress]::Any) -or $ip.Equals([Net.IPAddress]::IPv6Any)) { continue }
+        $prefix = if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { 32 } else { 128 }
+        $directCidrs += "$($ip.ToString())/$prefix"
+    }
+}
+$directCidrs = @($directCidrs | Select-Object -Unique)
+$options = [ordered]@{
+    domesticInterface=$DomesticInterface
+    overseasInterface=$OverseasInterface
+    preferredProxy=$PreferredProxy
+    tun=$true
+    ruleMode=$RuleMode
+    proxyIpVersion=$ProxyIpVersion
+    extraDirectDomains=@($ExtraDirectDomains | Select-Object -Unique)
+    extraDirectCidrs=$directCidrs
+}
 $replacement = "// BEGIN USER OPTIONS`nconst OPTIONS = " + ($options | ConvertTo-Json -Depth 4) + ";`n// END USER OPTIONS"
 $pattern = '(?s)// BEGIN USER OPTIONS.*?// END USER OPTIONS'
 if ([regex]::Matches($text, $pattern).Count -ne 1) { throw 'Expected one USER OPTIONS block in split-routing.js.' }

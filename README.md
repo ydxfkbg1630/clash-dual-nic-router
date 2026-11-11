@@ -8,13 +8,15 @@
 
 | 流量 | 出口 |
 | --- | --- |
-| 中国大陆域名 / IP | Ethernet → DIRECT |
-| 局域网和本地地址 | DIRECT，结合系统路由访问 |
-| 其他地址 | Wi-Fi → 已有代理节点 |
+| 校园 Portal、DNS、网关和自定义排除地址 | 域名直连绑定国内网卡；明确 IP 绕过 TUN，由系统路由选择出口 |
+| 原订阅中的应用、广告、站点策略 | 按原规则顺序执行；直连出口为网线，代理出口为 Wi-Fi |
+| 原规则覆盖以外的地址 | 中国大陆直连网线，其余使用 Wi-Fi 代理 |
 
-脚本设置全局 `interface-name` 为国内网卡，给代理节点设置国外网卡；通过 GeoSite / GeoIP 分类，最终规则落到 `Overseas via Wi-Fi` 策略组。默认启用 TUN、自动路由和 fake-IP DNS。
+脚本设置全局 `interface-name` 为国内网卡，给代理节点设置国外网卡。默认保留原规则顺序与动作，包括原有 `MATCH`；在原配置缺少最终规则时补充 GeoSite / GeoIP 分类和 `Overseas via Wi-Fi` 兜底。默认启用 TUN、自动路由和 fake-IP DNS。
 
-**应用后，原来的自定义规则列表将由国内/国外分流规则整体替换。** 现有代理节点参数和其他策略组继续保留；国内、国外的含义取决于本机 GeoSite / GeoIP 数据版本。网卡同时保持连接，代理节点通过 Wi-Fi 网络可以正常访问。
+**v1.1.0 默认保留原有规则、广告拦截、分应用和指定节点策略。** 明确配置的校园直连规则与私网规则优先，其后执行原规则。原订阅显式指定的跨区域例外也继续生效，例如某国外站点指定直连时仍走网线。需要严格按国内/国外整体分流时，显式设置 `ruleMode: 'replace'` 或 `-RuleMode replace`，这会整体替换原规则列表。
+
+从 v1.0.0 升级时，请在 Clash Verge 从原订阅重新生成运行配置；v1.1.0 会读取订阅里完整的规则。安装后的当前运行 YAML 可能仍含旧版简化规则，原订阅文件或先前备份是恢复来源。
 
 ## 准备
 
@@ -41,9 +43,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Install-Routing.ps1 `
   -DomesticInterface '以太网' -OverseasInterface 'WLAN 2'
 ```
 
-命令输出生成的 `Script.js` 路径。打开 Clash Verge 的订阅页面，进入**全局扩展脚本**，粘贴生成文件内容并保存。随后选择**规则模式**并开启 **TUN**。在代理页面的 `Overseas via Wi-Fi` 策略组中选择可用节点。
+命令输出生成的 `Script.js` 路径。打开 Clash Verge 的订阅页面，进入**全局扩展脚本**，粘贴生成文件内容并保存。随后选择**规则模式**并开启 **TUN**。在代理页面选择原订阅策略组的节点；当流量使用新增兜底时，在 `Overseas via Wi-Fi` 策略组中选择节点。
 
-要指定默认节点，追加 `-PreferredProxy '你的节点名称'`；默认采用配置中的首个可用节点。此参数精确匹配本地代理名称，provider 用户可在组中选择订阅节点。
+要指定新增兜底组的默认节点，追加 `-PreferredProxy '你的节点名称'`；默认采用配置中的首个可用节点。此参数精确匹配本地代理名称，provider 用户可在组中选择订阅节点。保留模式中，原有策略组和原 `MATCH` 的节点选择仍在各自组中设置。
 
 ### 文件安装与备份
 
@@ -77,17 +79,35 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Restore-Routing.ps1 `
 | --- | --- | --- |
 | `domesticInterface` | `Ethernet` | 国内直连网卡，填 Windows 中的实际名称 |
 | `overseasInterface` | `Wi-Fi` | 代理连接使用的网卡 |
-| `preferredProxy` | 空字符串 | 默认节点名称；空值使用首个本地节点 |
+| `preferredProxy` | 空字符串 | 新增兜底组的默认节点；空值使用首个本地节点 |
 | `tun` | `true` | 生成配置中的 TUN 开关；客户端开关同步设置 |
-| `extraDirectCidrs` | `[]` | 额外直连网段，例如自建 VPN 网段 |
+| `ruleMode` | `preserve` | 保留原规则；`replace` 为显式整体分流模式 |
+| `proxyIpVersion` | `ipv4` | 代理服务器连接使用 IPv4；支持 `dual`、`ipv6`、`ipv4-prefer`、`ipv6-prefer` |
+| `extraDirectCidrs` | `[]` | 校园 Portal / DNS / VPN 的明确 IP 网段，同时加入 TUN 排除列表 |
+| `extraDirectDomains` | `[]` | Portal 域名及其子域名：优先直连并使用真实 DNS 地址 |
 
-IPv6 设置继承现有配置。使用 IPv6 直连时，国内网卡需要相应 IPv6 连通性。
+全局 IPv6 与国内直连设置继承现有配置；远端代理节点及 provider 默认使用 `ip-version: ipv4`，避免热点缺少 IPv6 路由时选中 AAAA。IPv6-only 节点需要将 `proxyIpVersion` 改为 `ipv6` 或其他合适模式，并确认国外网卡 IPv6 连通性。实际 TCP 源地址仍应对应所选国外网卡。
 
 Provider 通过 `override.interface-name` 绑定国外网卡。带 `override-expr` 或静态 `dialer-proxy` 的配置会提示先整理链式设置。远程 provider 节点内容在扩展脚本执行阶段由内核另行加载，因此使用普通单跳 provider 节点，并在运行配置中核对其出口。自定义 DNS 上游和其他 DNS 字段保留，缺省上游为 `119.29.29.29`、`223.5.5.5`。
 
+## 校园认证与 DNS
+
+TUN 排除仅负责让流量交给系统路由；请保持国内网卡对应网关可达这些地址，并按实际源地址验证出口。安装脚本默认读取**国内网卡**的 DNS 和默认网关，将这些明确地址加入 `extraDirectCidrs`；`-SkipNetworkDiscovery` 可切换为全部手动配置。选择校园 Portal 时以学校提供的网址/IP 为准。Portal 的公共地址和校园 DNS 可这样添加（下列为文档示例）：
+
+```powershell
+.\scripts\Install-Routing.ps1 `
+  -DomesticInterface '以太网' -OverseasInterface 'WLAN 2' `
+  -ExtraDirectDomains 'portal.example.edu' `
+  -ExtraDirectCidrs @('192.0.2.10/32', '198.51.100.53/32') -Install
+```
+
+使用 PowerShell 的 `&` 或上述直接脚本调用来传递数组参数。域名会加入优先直连和 fake-IP 例外；其对应 IP 通过 `extraDirectCidrs` 加入 TUN `route-exclude-address`。填写 Portal 域名时也添加学校公布的实际 IP；单靠域名规则的流量仍由 TUN 收到后直连。学校改动认证地址后同步更新这些参数。
+
+DNS 原有 nameserver、fallback 等字段保留。`fake-ip-filter-mode: blacklist` 与 `rule` 支持合并 Portal 例外；whitelist 配置会提示先调整过滤模式，便于明确真实地址的解析方式。
+
 ## 验证实际出口
 
-在 Clash Verge 连接页面查看国内站点命中 `DIRECT`、国外站点命中 `Overseas via Wi-Fi`。Windows 的物理连接可以这样查看：
+在 Clash Verge 连接页面查看国内站点最终经过 `DIRECT`、国外代理站点最终经过订阅节点（原策略组或 `Overseas via Wi-Fi`）。Windows 的物理连接可以这样查看：
 
 ```powershell
 Get-NetIPAddress -AddressFamily IPv4 | Select-Object InterfaceAlias, IPAddress
@@ -123,4 +143,4 @@ Clash Verge Rev、Mihomo 和 GeoSite / GeoIP 数据由各自项目维护，许�
 
 ## English overview
 
-A configurable Clash Verge Rev enhancement script for Windows dual-NIC routing: China traffic uses Ethernet directly, while overseas traffic reaches existing proxy nodes over Wi-Fi. Set adapter names in `OPTIONS`, save the script in Clash Verge's global script editor, select Rule mode, and enable TUN. PowerShell helpers generate/install the script and restore backups. Existing routing rules are replaced by the country split; node credentials remain in the local Clash configuration. Apache-2.0 licensed.
+A configurable Clash Verge Rev enhancement script for Windows dual-NIC routing: China traffic uses Ethernet directly, while overseas traffic reaches existing proxy nodes over Wi-Fi. Set adapter names in `OPTIONS`, save the script in Clash Verge's global script editor, select Rule mode, and enable TUN. PowerShell helpers generate/install the script and restore backups. Version 1.1 preserves existing rules by default, including ad blocking, application policies, and the original MATCH. Explicit policies take precedence over geographic fallback. Opt into `ruleMode: "replace"` for a full country split. Proxy transports default to IPv4; domestic IPv6 remains inherited. Campus domains receive real-IP DNS exceptions, and explicit campus/DNS/gateway CIDRs bypass TUN. Node credentials remain in the local Clash configuration. Apache-2.0 licensed.

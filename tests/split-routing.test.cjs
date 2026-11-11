@@ -39,8 +39,8 @@ test('routes domestic traffic through Ethernet and proxy sockets through Wi-Fi w
   const group = out['proxy-groups'].at(-1);
   assert.deepEqual(group.proxies, ['Example A', 'Example B']);
   assert.equal(group.name, 'Overseas via Wi-Fi');
-  assert.equal(out.rules.at(-1), 'MATCH,Overseas via Wi-Fi');
-  for (const rule of ['GEOSITE,private,DIRECT', 'GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT', 'IP-CIDR6,::1/128,DIRECT,no-resolve', 'IP-CIDR6,fc00::/7,DIRECT,no-resolve', 'IP-CIDR6,fe80::/10,DIRECT,no-resolve']) assert.ok(out.rules.includes(rule));
+  assert.equal(out.rules.at(-1), 'MATCH,DIRECT');
+  for (const rule of ['IP-CIDR6,::1/128,DIRECT,no-resolve', 'IP-CIDR6,fc00::/7,DIRECT,no-resolve', 'IP-CIDR6,fe80::/10,DIRECT,no-resolve']) assert.ok(out.rules.includes(rule));
 });
 
 test('preferred local proxy comes first and missing or non-proxy preferences fail', () => {
@@ -135,4 +135,108 @@ test('rejects empty configurations and validates additional direct ranges', () =
   const out = transform(fixture(), { extraDirectCidrs: ['198.18.0.0/15', '2001:db8::/32'] });
   assert.ok(out.rules.includes('IP-CIDR,198.18.0.0/15,DIRECT,no-resolve'));
   assert.ok(out.rules.includes('IP-CIDR6,2001:db8::/32,DIRECT,no-resolve'));
+});
+
+test('preserve mode retains every original rule, its order, and its final policy', () => {
+  const input = fixture();
+  input.rules = ['DOMAIN,ads.example,REJECT', 'PROCESS-NAME,game.exe,Existing', 'DOMAIN,special.example,Example B', 'MATCH,Existing', 'DOMAIN,after.example,DIRECT'];
+  const out = transform(input);
+  assert.deepEqual(out.rules.slice(-input.rules.length), input.rules);
+  assert.equal(out.rules.filter((rule) => rule.startsWith('MATCH,')).length, 1);
+  assert.deepEqual(transform(out), out);
+  assert.throws(() => transform(input, { ruleMode: 'invalid' }), /ruleMode/);
+});
+
+test('appends domestic and overseas defaults only when original rules have no terminal rule', () => {
+  const input = fixture();
+  input.rules = ['DOMAIN,ads.example,REJECT'];
+  const out = transform(input);
+  assert.deepEqual(out.rules.slice(-5), input.rules.concat(['GEOSITE,private,DIRECT', 'GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT', 'MATCH,Overseas via Wi-Fi']));
+  assert.deepEqual(transform(out), out);
+  input.rules = ['FINAL,Existing'];
+  assert.equal(transform(input).rules.at(-1), 'FINAL,Existing');
+});
+
+test('replace mode explicitly selects full domestic and overseas routing', () => {
+  const input = fixture();
+  const out = transform(input, { ruleMode: 'replace' });
+  assert.equal(out.rules.includes('MATCH,DIRECT'), false);
+  assert.deepEqual(out.rules.slice(-4), ['GEOSITE,private,DIRECT', 'GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT', 'MATCH,Overseas via Wi-Fi']);
+  assert.deepEqual(transform(out, { ruleMode: 'replace' }), out);
+});
+
+test('public portal and DNS ranges bypass TUN while portal domains receive real IPs', () => {
+  const input = fixture();
+  input.dns = { 'fake-ip-filter': ['+.already.example'], 'fake-ip-filter-mode': 'blacklist' };
+  input.tun = { 'route-exclude-address': ['203.0.113.8/32'] };
+  const options = { extraDirectCidrs: ['198.51.100.2/32', '2001:db8::/32', '198.51.100.2/32'], extraDirectDomains: ['Portal.Example.', 'portal.example', 'already.example'] };
+  const out = transform(input, options);
+  assert.deepEqual(out.dns['fake-ip-filter'], ['+.already.example', '+.portal.example']);
+  assert.deepEqual(out.tun['route-exclude-address'], ['203.0.113.8/32', '198.51.100.2/32', '2001:db8::/32']);
+  assert.deepEqual(out.rules.slice(0, 2), ['DOMAIN-SUFFIX,portal.example,DIRECT', 'DOMAIN-SUFFIX,already.example,DIRECT']);
+  assert.ok(out.rules.includes('IP-CIDR,198.51.100.2/32,DIRECT,no-resolve'));
+  assert.deepEqual(transform(out, options), out);
+  const cleared = transform(out);
+  assert.deepEqual(cleared.dns['fake-ip-filter'], input.dns['fake-ip-filter']);
+  assert.deepEqual(cleared.tun['route-exclude-address'], input.tun['route-exclude-address']);
+  assert.equal(cleared.rules.some((rule) => rule.includes('portal.example')), false);
+});
+
+test('supports rule-based fake-IP filters and explains whitelist conversion', () => {
+  const input = fixture();
+  input.dns = { 'fake-ip-filter-mode': 'rule', 'fake-ip-filter': ['MATCH,fake-ip', 'DOMAIN-SUFFIX,portal.example,real-ip'] };
+  const options = { extraDirectDomains: ['portal.example', 'login.example'] };
+  const out = transform(input, options);
+  assert.deepEqual(out.dns['fake-ip-filter'], ['DOMAIN-SUFFIX,portal.example,real-ip', 'DOMAIN-SUFFIX,login.example,real-ip', 'MATCH,fake-ip']);
+  assert.deepEqual(transform(out, options), out);
+  input.dns = { 'fake-ip-filter-mode': 'whitelist', 'fake-ip-filter': ['+.example'] };
+  assert.deepEqual(transform(input).dns['fake-ip-filter'], ['+.example']);
+  assert.throws(() => transform(input, options), /whitelist.*explicitly/);
+});
+
+test('validates domain names and preserves input on every validation failure', () => {
+  const input = fixture();
+  const before = structuredClone(input);
+  for (const domain of ['portal.example\nMATCH,REJECT', 'portal.example,DIRECT', '*.example', 'https://portal.example', '-invalid.example', 'a'.repeat(64) + '.example', '192.0.2.1', ' portal.example', '', null]) {
+    assert.throws(() => transform(input, { extraDirectDomains: [domain] }), /domain|extraDirectDomains/);
+  }
+  assert.throws(() => transform(input, { extraDirectDomains: 'portal.example' }), /extraDirectDomains/);
+  assert.deepEqual(input, before);
+});
+
+test('defaults remote proxy connections to IPv4 while keeping direct and global IPv6 settings', () => {
+  const input = fixture();
+  input.proxies[2]['ip-version'] = 'ipv6-prefer';
+  input.dns = { ipv6: true };
+  input['proxy-providers'] = { Inline: { type: 'inline', override: { udp: true, 'ip-version': 'ipv6' }, payload: [
+    { name: 'Remote', type: 'socks5', server: 'proxy.example', port: 1080 },
+    { name: 'Local', type: 'direct', 'ip-version': 'ipv6' },
+  ] } };
+  for (const proxyIpVersion of ['ipv4', 'dual', 'ipv6', 'ipv4-prefer', 'ipv6-prefer']) {
+    const out = transform(input, { proxyIpVersion });
+    assert.equal(out.proxies[0]['ip-version'], proxyIpVersion);
+    assert.equal(out.proxies[1]['ip-version'], proxyIpVersion);
+    assert.equal(out['proxy-providers'].Inline.override['ip-version'], proxyIpVersion);
+    assert.equal(out['proxy-providers'].Inline.override.udp, true);
+    assert.equal(out['proxy-providers'].Inline.payload[0]['ip-version'], proxyIpVersion);
+    assert.equal(out['proxy-providers'].Inline.payload[1]['ip-version'], 'ipv6');
+    assert.equal(out.proxies[2]['ip-version'], 'ipv6-prefer');
+    assert.equal(out.ipv6, true);
+    assert.equal(out.dns.ipv6, true);
+  }
+  assert.equal(transform(input).proxies[0]['ip-version'], 'ipv4');
+  assert.throws(() => transform(input, { proxyIpVersion: 'v4' }), /proxyIpVersion/);
+});
+
+test('updates generated exclusions without deleting original duplicate or similar rules', () => {
+  const input = fixture();
+  input.rules.unshift('DOMAIN-SUFFIX,portal.example,DIRECT');
+  const once = transform(input, { extraDirectDomains: ['portal.example'] });
+  const twice = transform(once, { extraDirectDomains: ['login.example'] });
+  assert.deepEqual(twice.rules.slice(-input.rules.length), input.rules);
+  assert.equal(twice.rules[0], 'DOMAIN-SUFFIX,login.example,DIRECT');
+  assert.equal(twice.rules.filter((rule) => rule === 'DOMAIN-SUFFIX,portal.example,DIRECT').length, 1);
+  const edited = structuredClone(once);
+  edited.rules[0] = 'DOMAIN-SUFFIX,portal.example,REJECT';
+  assert.throws(() => transform(edited), /boundaries changed/);
 });
