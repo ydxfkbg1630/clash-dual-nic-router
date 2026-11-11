@@ -3,7 +3,7 @@ param(
     [string]$DomesticInterface,
     [string]$OverseasInterface,
     [string]$PreferredProxy = '',
-    [ValidateSet('preserve', 'replace')][string]$RuleMode = 'preserve',
+    [ValidateSet('preserve', 'replace', 'strict')][string]$RuleMode = 'preserve',
     [ValidateSet('ipv4', 'dual', 'ipv6', 'ipv4-prefer', 'ipv6-prefer')][string]$ProxyIpVersion = 'ipv4',
     [string[]]$ExtraDirectDomains = @(),
     [string[]]$ExtraDirectCidrs = @(),
@@ -27,6 +27,7 @@ foreach ($name in @($DomesticInterface, $OverseasInterface)) {
     $adapter = @(Get-NetAdapter | Where-Object Name -eq $name)
     if ($adapter.Count -ne 1 -or $adapter[0].Status -ne 'Up') { throw "Connect the network adapter first: $name" }
 }
+if ($RuleMode -eq 'strict' -and $ProxyIpVersion -ne 'ipv4') { throw 'Strict mode requires -ProxyIpVersion ipv4.' }
 $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'split-routing.js'
 $text = [IO.File]::ReadAllText($source)
 # Keep the domestic adapter's DNS and gateways reachable outside TUN, including

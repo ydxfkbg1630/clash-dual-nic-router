@@ -35,8 +35,17 @@ function main(config) {
   if (typeof OPTIONS.preferredProxy !== 'string') fail('Set preferredProxy to a local proxy name or an empty string.');
   if (!Array.isArray(OPTIONS.extraDirectCidrs)) fail('Set extraDirectCidrs to an array of CIDR strings.');
   if (!Array.isArray(OPTIONS.extraDirectDomains)) fail('Set extraDirectDomains to an array of domain names.');
-  if (!['preserve', 'replace'].includes(OPTIONS.ruleMode)) fail('Set ruleMode to preserve or replace.');
+  if (!['preserve', 'replace', 'strict'].includes(OPTIONS.ruleMode)) fail('Set ruleMode to preserve, replace, or strict.');
   if (!['dual', 'ipv4', 'ipv6', 'ipv4-prefer', 'ipv6-prefer'].includes(OPTIONS.proxyIpVersion)) fail('Set proxyIpVersion to dual, ipv4, ipv6, ipv4-prefer, or ipv6-prefer.');
+  const strict = OPTIONS.ruleMode === 'strict';
+  if (strict && (!OPTIONS.tun || OPTIONS.proxyIpVersion !== 'ipv4')) fail('strict mode requires tun: true and proxyIpVersion: ipv4.');
+  const udpSwitchTypes = new Set(['ss', 'trojan', 'vmess', 'vless', 'socks5']);
+  const bindRemote = (proxy) => {
+    proxy['interface-name'] = OPTIONS.overseasInterface;
+    proxy['ip-version'] = OPTIONS.proxyIpVersion;
+    // This enables client UDP forwarding; the remote server must also support it.
+    if (strict && udpSwitchTypes.has(proxy.type.toLowerCase())) proxy.udp = true;
+  };
 
   // Clash hands the extension a JSON-compatible configuration object.
   const out = JSON.parse(JSON.stringify(config));
@@ -50,8 +59,7 @@ function main(config) {
     rejectChain(proxy, 'Proxy ' + proxy.name);
     if (String(proxy.type).toLowerCase() === 'direct') proxy['interface-name'] = OPTIONS.domesticInterface;
     else if (realProxy(proxy)) {
-      proxy['interface-name'] = OPTIONS.overseasInterface;
-      proxy['ip-version'] = OPTIONS.proxyIpVersion;
+      bindRemote(proxy);
       if (!candidates.includes(proxy.name)) candidates.push(proxy.name);
     }
   }
@@ -71,14 +79,14 @@ function main(config) {
       for (const proxy of provider.payload) {
         rejectChain(proxy, 'Provider ' + name + ' payload');
         if (realProxy(proxy)) {
-          proxy['interface-name'] = OPTIONS.overseasInterface;
-          proxy['ip-version'] = OPTIONS.proxyIpVersion;
+          bindRemote(proxy);
         }
         else if (isObject(proxy) && String(proxy.type).toLowerCase() === 'direct') proxy['interface-name'] = OPTIONS.domesticInterface;
       }
       if (provider.type === 'inline' && !provider.payload.some(realProxy)) fail('Provider ' + name + ': add a real proxy to the inline payload.');
     } else if (provider.type === 'inline') fail('Provider ' + name + ': add a real proxy payload.');
     provider.override = Object.assign({}, override, { 'interface-name': OPTIONS.overseasInterface, 'ip-version': OPTIONS.proxyIpVersion });
+    if (strict) provider.override.udp = true;
     provider['exclude-type'] = [...new Set(String(provider['exclude-type'] || '').split('|').filter(Boolean).concat([...reservedTypes]))].join('|');
   }
   if (!candidates.length && !providerNames.length) fail('Add at least one real proxy or proxy-provider to the configuration.');
@@ -164,8 +172,12 @@ function main(config) {
   }
   const prefix = [...new Set(directDomains.map((domain) => 'DOMAIN-SUFFIX,' + domain + ',DIRECT').concat(rules))];
   const preserved = OPTIONS.ruleMode === 'preserve' ? originalRules : [];
-  const suffix = preserved.some((rule) => /^\s*(MATCH|FINAL)\s*,/i.test(rule)) ? [] :
-    ['GEOSITE,private,DIRECT', 'GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT', 'MATCH,' + groupName];
+  const overseasDomains = ['microsoft.com', 'microsoftonline.com', 'live.com', 'bing.com', 'apple.com', 'icloud.com'];
+  const suffix = strict ? ['GEOSITE,private,DIRECT']
+    .concat(overseasDomains.map((domain) => 'DOMAIN-SUFFIX,' + domain + ',' + groupName),
+      ['GEOSITE,geolocation-!cn,' + groupName, 'GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT', 'MATCH,' + groupName]) :
+    preserved.some((rule) => /^\s*(MATCH|FINAL)\s*,/i.test(rule)) ? [] :
+      ['GEOSITE,private,DIRECT', 'GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT', 'MATCH,' + groupName];
   out.rules = prefix.concat(preserved, suffix);
   if (out.dns !== undefined && !isObject(out.dns)) fail('dns must be a mapping.');
   if (out.tun !== undefined && !isObject(out.tun)) fail('tun must be a mapping.');
@@ -188,5 +200,49 @@ function main(config) {
   const dnsFilters = mergeGenerated(out.dns, 'fake-ip-filter', filters, previousRules && previousRules.dnsFilters, filterMode === 'rule');
   const tunExclusions = mergeGenerated(out.tun, 'route-exclude-address', directCidrs, previousRules && previousRules.tunExclusions);
   out[ruleMarker] = { prefix, suffix, dnsFilters, tunExclusions };
+  const oldPolicies = previousRules && previousRules.dnsPolicies;
+  if (oldPolicies !== undefined && !isObject(oldPolicies)) fail('Restore generated nameserver-policy metadata.');
+  if (out.dns['nameserver-policy'] !== undefined && !isObject(out.dns['nameserver-policy'])) fail('dns.nameserver-policy must be a mapping.');
+  const policies = out.dns['nameserver-policy'] || {};
+  for (const key of Object.keys(oldPolicies || {})) {
+    if (JSON.stringify(policies[key]) === JSON.stringify(oldPolicies[key])) delete policies[key];
+  }
+  if (strict) {
+    out.ipv6 = false;
+    out['find-process-mode'] = 'always';
+    out.dns.ipv6 = false;
+    out.dns['respect-rules'] = true;
+    out.dns['prefer-h3'] = false;
+    const domesticDns = ['119.29.29.29', '223.5.5.5'];
+    // Independent IP-based defaults break the DNS -> proxy hostname -> DNS cycle.
+    // Explicit upstream choices remain owned by the subscription/user.
+    for (const key of ['default-nameserver', 'proxy-server-nameserver', 'direct-nameserver']) {
+      if (out.dns[key] === undefined || (Array.isArray(out.dns[key]) && out.dns[key].length === 0)) out.dns[key] = domesticDns.slice();
+      if (!Array.isArray(out.dns[key]) || !out.dns[key].every((item) => typeof item === 'string')) fail('dns.' + key + ' must be an array of nameservers.');
+    }
+    out.dns['direct-nameserver-follow-policy'] = true;
+    const generatedPolicies = {};
+    for (const key of ['geosite:private', 'geosite:cn'].concat(directDomains.map((domain) => '+.' + domain))) {
+      if (!Object.prototype.hasOwnProperty.call(policies, key)) {
+        policies[key] = domesticDns.slice();
+        generatedPolicies[key] = domesticDns.slice();
+      }
+    }
+    out.dns['nameserver-policy'] = policies;
+    out[ruleMarker].dnsPolicies = generatedPolicies;
+    out.tun['strict-route'] = true;
+    mergeGenerated(out.tun, 'dns-hijack', ['any:53', 'tcp://any:53']);
+    if (out.sniffer !== undefined && !isObject(out.sniffer)) fail('sniffer must be a mapping.');
+    out.sniffer = Object.assign({}, out.sniffer || {}, { enable: true, 'parse-pure-ip': true, 'override-destination': false });
+    if (out.sniffer.sniff !== undefined && !isObject(out.sniffer.sniff)) fail('sniffer.sniff must be a mapping.');
+    out.sniffer.sniff = out.sniffer.sniff || {};
+    for (const [protocol, ports] of [['HTTP', [80, '8080-8880']], ['TLS', [443, 8443]], ['QUIC', [443, 8443]]]) {
+      const current = out.sniffer.sniff[protocol];
+      if (current !== undefined && !isObject(current)) fail('sniffer.sniff.' + protocol + ' must be a mapping.');
+      const existingPorts = (current && current.ports) || [];
+      if (!Array.isArray(existingPorts)) fail('sniffer.sniff.' + protocol + '.ports must be an array.');
+      out.sniffer.sniff[protocol] = Object.assign({}, current || {}, { ports: [...new Set(existingPorts.concat(ports))], 'override-destination': false });
+    }
+  }
   return out;
 }

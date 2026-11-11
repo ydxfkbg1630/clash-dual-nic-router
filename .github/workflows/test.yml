@@ -20,4 +20,6 @@ jobs:
       - name: PowerShell integration tests
         if: runner.os == 'Windows'
         shell: powershell
-        run: ./tests/installer.test.ps1
+        run: |
+          ./tests/installer.test.ps1
+          ./tests/ipv4-only.test.ps1

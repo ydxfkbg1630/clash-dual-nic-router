@@ -240,3 +240,90 @@ test('updates generated exclusions without deleting original duplicate or simila
   edited.rules[0] = 'DOMAIN-SUFFIX,portal.example,REJECT';
   assert.throws(() => transform(edited), /boundaries changed/);
 });
+
+test('strict mode prioritizes overseas domains and replaces subscription direct exceptions', () => {
+  const input = fixture();
+  input.rules = ['DOMAIN-SUFFIX,microsoft.com,DIRECT', 'MATCH,DIRECT'];
+  const before = structuredClone(input);
+  const options = { ruleMode: 'strict', extraDirectDomains: ['portal.example'] };
+  const out = transform(input, options);
+  assert.deepEqual(input, before);
+  assert.equal(out.rules[0], 'DOMAIN-SUFFIX,portal.example,DIRECT');
+  assert.equal(out.rules.includes('MATCH,DIRECT'), false);
+  const overseas = out.rules.indexOf('GEOSITE,geolocation-!cn,Overseas via Wi-Fi');
+  assert.ok(overseas > out.rules.indexOf('GEOSITE,private,DIRECT'));
+  assert.ok(overseas < out.rules.indexOf('GEOSITE,cn,DIRECT'));
+  for (const domain of ['microsoft.com', 'microsoftonline.com', 'live.com', 'bing.com', 'apple.com', 'icloud.com']) {
+    const position = out.rules.indexOf('DOMAIN-SUFFIX,' + domain + ',Overseas via Wi-Fi');
+    assert.ok(position > -1 && position < overseas);
+  }
+  assert.deepEqual(out.rules.slice(-3), ['GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT', 'MATCH,Overseas via Wi-Fi']);
+  assert.deepEqual(out['proxy-groups'].at(-1).proxies, ['Example A', 'Example B']);
+  assert.deepEqual(transform(out, options), out);
+});
+
+test('strict mode requires IPv4 proxy transport and TUN, enables route and DNS interception', () => {
+  for (const options of [{ tun: false }, { proxyIpVersion: 'dual' }, { proxyIpVersion: 'ipv6' }]) {
+    assert.throws(() => transform(fixture(), { ruleMode: 'strict', ...options }), /strict.*tun.*ipv4/i);
+  }
+  const input = fixture();
+  input.tun = { stack: 'mixed', 'strict-route': false, 'dns-hijack': ['udp://192.0.2.53:53'] };
+  const out = transform(input, { ruleMode: 'strict' });
+  assert.equal(out.ipv6, false);
+  assert.equal(out.dns.ipv6, false);
+  assert.equal(out['find-process-mode'], 'always');
+  assert.equal(out.tun.enable, true);
+  assert.equal(out.tun['strict-route'], true);
+  assert.equal(out.tun.stack, 'mixed');
+  assert.deepEqual(out.tun['dns-hijack'], ['udp://192.0.2.53:53', 'any:53', 'tcp://any:53']);
+  assert.equal(out.sniffer.enable, true);
+  assert.equal(out.sniffer['parse-pure-ip'], true);
+  for (const protocol of ['HTTP', 'TLS', 'QUIC']) assert.equal(out.sniffer.sniff[protocol]['override-destination'], false);
+});
+
+test('strict DNS keeps custom upstreams, supplies independent bootstrap, and merges portal policies', () => {
+  const input = fixture();
+  input.dns = { nameserver: ['https://dns.example/dns-query'], fallback: ['tls://fallback.example'],
+    'prefer-h3': true, 'nameserver-policy': { '+.custom.example': '192.0.2.53', '+.portal.example': ['192.0.2.54'] } };
+  input.sniffer = { 'skip-domain': ['+.sensitive.example'], sniff: { HTTP: { ports: [8080], 'override-destination': true } } };
+  const before = structuredClone(input);
+  const options = { ruleMode: 'strict', extraDirectDomains: ['portal.example', 'login.example'] };
+  const out = transform(input, options);
+  assert.deepEqual(input, before);
+  assert.deepEqual(out.dns.nameserver, input.dns.nameserver);
+  assert.deepEqual(out.dns.fallback, input.dns.fallback);
+  assert.equal(out.dns['respect-rules'], true);
+  assert.equal(out.dns['prefer-h3'], false);
+  assert.deepEqual(out.dns['default-nameserver'], ['119.29.29.29', '223.5.5.5']);
+  assert.deepEqual(out.dns['proxy-server-nameserver'], ['119.29.29.29', '223.5.5.5']);
+  assert.deepEqual(out.dns['direct-nameserver'], ['119.29.29.29', '223.5.5.5']);
+  assert.equal(out.dns['direct-nameserver-follow-policy'], true);
+  assert.deepEqual(out.dns['nameserver-policy']['+.portal.example'], ['192.0.2.54']);
+  assert.deepEqual(out.dns['nameserver-policy']['+.login.example'], ['119.29.29.29', '223.5.5.5']);
+  assert.equal(out.dns['nameserver-policy']['+.custom.example'], '192.0.2.53');
+  assert.deepEqual(out.sniffer['skip-domain'], input.sniffer['skip-domain']);
+  assert.ok(out.sniffer.sniff.HTTP.ports.includes(8080));
+  assert.deepEqual(transform(out, options), out);
+  const cleared = transform(out, { ruleMode: 'strict' });
+  assert.equal(Object.hasOwn(cleared.dns['nameserver-policy'], '+.login.example'), false);
+  assert.deepEqual(cleared.dns['nameserver-policy']['+.portal.example'], ['192.0.2.54']);
+});
+
+test('strict DNS preserves explicitly configured bootstrap and direct upstreams', () => {
+  const input = fixture();
+  input.dns = { 'default-nameserver': ['192.0.2.51'], 'proxy-server-nameserver': ['192.0.2.52'], 'direct-nameserver': ['192.0.2.53'] };
+  const out = transform(input, { ruleMode: 'strict' });
+  for (const key of Object.keys(input.dns)) assert.deepEqual(out.dns[key], input.dns[key]);
+});
+
+test('strict mode enables UDP on supported node types and provider overrides', () => {
+  const input = fixture();
+  input.proxies = ['ss', 'trojan', 'vmess', 'vless', 'socks5', 'http'].map((type) => ({ name: type, type, udp: false }));
+  input['proxy-providers'] = { Inline: { type: 'inline', payload: [{ name: 'Relay', type: 'ss', udp: false }] }, Remote: { type: 'http', url: 'https://subscription.example/proxies.yaml' } };
+  const out = transform(input, { ruleMode: 'strict' });
+  for (const proxy of out.proxies.slice(0, 5)) assert.equal(proxy.udp, true);
+  assert.equal(out.proxies.at(-1).udp, false);
+  assert.equal(out['proxy-providers'].Inline.payload[0].udp, true);
+  for (const provider of Object.values(out['proxy-providers'])) assert.equal(provider.override.udp, true);
+  assert.deepEqual(transform(out, { ruleMode: 'strict' }), out);
+});

@@ -103,3 +103,22 @@ try { & $install -DomesticInterface 'Test Ethernet' -OverseasInterface 'Test Eth
 Assert $bad 'Same-interface input was accepted.'
 Write-Output 'PASS: discovery, explicit portal routes, defaults, policy overrides, offline generation, deduplication, custom-script guard, install, escaping, backup, changed-file guard, restore, edit preservation, distinct adapters.'
 Write-Output "Temporary test files: $root"
+
+$strictState = Join-Path $root 'strict'
+& $install -DomesticInterface 'Test Ethernet' -OverseasInterface 'Test Wi-Fi' -StateDirectory $strictState -SkipNetworkDiscovery -RuleMode strict | Out-Null
+$strictFile = Get-ChildItem -LiteralPath $strictState -Filter Script.js -Recurse | Select-Object -First 1
+Assert ((Read-GeneratedOptions $strictFile.FullName).ruleMode -eq 'strict') 'Strict mode was lost.'
+@'
+const fs=require('fs'), vm=require('vm'), assert=require('node:assert/strict');
+vm.runInThisContext(fs.readFileSync(process.argv[2],'utf8'));
+const output=main({proxies:[{name:'Example',type:'ss',server:'192.0.2.1',port:443}],rules:['MATCH,DIRECT']});
+assert.equal(output.tun['strict-route'],true);
+assert.equal(output.ipv6,false);
+assert(output.rules.some(r=>r.startsWith('GEOSITE,geolocation-!cn,')));
+assert(!output.rules.includes('MATCH,DIRECT'));
+'@ | & node - $strictFile.FullName
+Assert ($LASTEXITCODE -eq 0) 'Strict generated script integration failed.'
+$invalidStrict = $false
+try { & $install -DomesticInterface 'Test Ethernet' -OverseasInterface 'Test Wi-Fi' -StateDirectory $strictState -RuleMode strict -ProxyIpVersion dual | Out-Null } catch { $invalidStrict = $true }
+Assert $invalidStrict 'Strict accepted a conflicting IP version.'
+Write-Output 'PASS: strict mode generation, execution, and IP-version validation.'
