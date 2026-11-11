@@ -151,6 +151,37 @@ IPv4-only 模式适用于两条出口都有 IPv4 连通性的环境，会影响�
 
 本项目的原始部署在 Windows 实机验证了 12 个国内站点经校园网、12 个国外站点经 Wi-Fi（含 Microsoft/Bing/Apple），微信与 Codex 进程分别匹配校园网和 Wi-Fi，国内/国外 UDP 均收到响应。最后一轮公网 TCP 快照 20 条均符合目标出口。以上为一次本地部署证据；通用发行版本另由单元测试、Windows 模拟网卡测试和内核配置校验验证。运行时地址、账号、订阅、连接记录保留在部署机器。
 
+## 拔网线自动回退（v1.3.0）
+
+安装可选后台监测器后：
+
+| 网络状态 | 国内流量 | 国外流量 |
+| --- | --- | --- |
+| 网线可用、Wi-Fi 已连接 | 校园网直连 | Wi-Fi 代理 |
+| 网线断开、Wi-Fi 已连接 | Wi-Fi 直连 | Wi-Fi 代理 |
+| 网线稳定恢复 | 恢复校园网直连 | 继续 Wi-Fi 代理 |
+
+准备 Node.js 20+、正在运行的 Clash Verge 和前面的双网卡配置。监测器使用本机命名管道 `verge-mihomo` 访问内核；每 5 秒查看网卡链路、IPv4 地址和默认网关路由，网线连续 3 次就绪后恢复校园网。就绪判断覆盖链路和 IP 配置；校园 Portal 登录仍由使用者完成。
+
+```powershell
+.\scripts\Install-AutoFallback.ps1 `
+  -DomesticInterface '以太网' -OverseasInterface 'WLAN 2' -Install
+```
+
+网线处于断开状态时也可安装。默认命令省略 `-Install` 时仅生成配置供查看；`-WhatIf` 预览安装动作。安装会复制监测脚本到用户状态目录、设置当前用户登录启动项，并在隐藏窗口运行。配置、状态与日志默认位于 `%LOCALAPPDATA%\clash-dual-nic-router\auto-fallback`。
+
+监测器仅更新内核的全局直连出口，代理节点继续绑定 Wi-Fi。切换后会清理内核现有连接，让应用按新出口重连，因此正在传输的连接可能短暂重建。每轮也核对运行接口，可在客户端重载配置后重新应用适合当前网络的出口。两网卡同时离线时等待链路恢复。
+
+本工具适用于本仓库生成的 **内置 DIRECT / 全局 interface-name** 结构。自定义 `type: direct` 节点上的独立接口、DNS 上游的 `#接口名` 和额外系统路由各自有独立约束；使用自动回退时请将国内流量归入内置 DIRECT，并按需要合并这些配置。Portal 位于校园内网时，其页面依赖校园网络可达性。
+
+卸载监测器：
+
+```powershell
+.\scripts\Install-AutoFallback.ps1 -Uninstall
+```
+
+卸载会请求后台进程退出，并恢复该工具安装前的登录启动项；双网卡规则和最后一次运行出口继续保留。可在 Clash Verge 重载配置恢复静态分流。日志按大小轮转，状态变更和错误会记录到本机。
+
 ## 验证实际出口
 
 在 Clash Verge 连接页面查看国内站点最终经过 `DIRECT`、国外代理站点最终经过订阅节点（原策略组或 `Overseas via Wi-Fi`）。Windows 的物理连接可以这样查看：
@@ -174,6 +205,7 @@ npm run check
 npm test
 powershell -ExecutionPolicy Bypass -File .\tests\installer.test.ps1
 powershell -ExecutionPolicy Bypass -File .\tests\ipv4-only.test.ps1
+powershell -ExecutionPolicy Bypass -File .\tests\auto-fallback.test.ps1
 ```
 
 项目运行依赖为零。CI 在 Windows / Linux、Node.js 22 / 24 上测试配置转换，Windows 上测试安装和恢复。
@@ -191,3 +223,5 @@ Clash Verge Rev、Mihomo 和 GeoSite / GeoIP 数据由各自项目维护，许�
 ## English overview
 
 A configurable Clash Verge Rev enhancement script for Windows dual-NIC routing: China traffic uses Ethernet directly, while overseas traffic reaches existing proxy nodes over Wi-Fi. Set adapter names in `OPTIONS`, save the script in Clash Verge's global script editor, select Rule mode, and enable TUN. PowerShell helpers generate/install the script and restore backups. Version 1.1 preserves existing rules by default, including ad blocking, application policies, and the original MATCH. Explicit policies take precedence over geographic fallback. Version 1.2 adds `ruleMode: "strict"` for service-domain-first routing, strict TUN, DNS routing, IPv4 transports and sniffing. A preview/apply/restore PowerShell helper handles adapter IPv6 state using GUID-verified backups. Reconnect existing application sessions and verify physical source addresses. `replace` retains the older country-only rule replacement. Proxy transports default to IPv4; domestic IPv6 remains inherited. Campus domains receive real-IP DNS exceptions, and explicit campus/DNS/gateway CIDRs bypass TUN. Node credentials remain in the local Clash configuration. Apache-2.0 licensed.
+
+Version 1.3 adds an optional Windows background watcher: domestic DIRECT uses Wi-Fi while Ethernet is disconnected and returns to Ethernet after three ready samples. Existing overseas proxy bindings remain on Wi-Fi. The watcher uses the local Mihomo named pipe, validates the applied interface, and logs state changes. Install/uninstall commands manage a per-user startup entry.

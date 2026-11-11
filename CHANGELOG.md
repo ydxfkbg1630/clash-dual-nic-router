@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0
+
+- Add an opt-in Windows fallback watcher: move domestic DIRECT to Wi-Fi on Ethernet loss and restore Ethernet after stable recovery.
+- Reconcile interface settings after core reloads, verify API changes and rebuild active connections on transition.
+- Add per-user background startup/install/uninstall, local state and bounded logs.
+
 ## 1.2.0
 
 - Add opt-in strict routing with foreign-service precedence, strict TUN routing, IPv4 and rule-aware DNS.
