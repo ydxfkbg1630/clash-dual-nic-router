@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.1
+
+- Supervise the fallback worker and restart it after unexpected exits, with local exit diagnostics.
+- Retry state/log file write errors while preserving active network monitoring.
+- Record adapter readiness details and permit installation while the campus USB adapter is unplugged.
+
 ## 1.3.0
 
 - Add an opt-in Windows fallback watcher: move domestic DIRECT to Wi-Fi on Ethernet loss and restore Ethernet after stable recovery.

@@ -36,10 +36,19 @@ function Get-OwnedWatcher($Manifest) {
 function Request-WatcherStop($Manifest) {
     Save-Json $Manifest.stopFile ([ordered]@{ requestedAt = [DateTime]::UtcNow.ToString('o') })
     $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(15, [int]$Manifest.intervalSeconds + 10))
-    while (@(Get-OwnedWatcher $Manifest).Count -gt 0) {
+    $supervisorPath = Join-Path (Split-Path $Manifest.configFile -Parent) 'launch.ps1'
+    $supervisorSuffix = '-File "' + $supervisorPath + '"'
+    $supervisorExecutable = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    do {
+        $watchers = @(Get-OwnedWatcher $Manifest)
+        $supervisors = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object {
+            $_.ExecutablePath -eq $supervisorExecutable -and $null -ne $_.CommandLine -and
+            $_.CommandLine.EndsWith($supervisorSuffix, [StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($watchers.Count -eq 0 -and $supervisors.Count -eq 0) { break }
         if ([DateTime]::UtcNow -ge $deadline) { throw 'The watcher is finishing a request. Retry after it exits; the stop request remains saved.' }
         Start-Sleep -Milliseconds 250
-    }
+    } while ($true)
 }
 
 if ($Uninstall) {
@@ -65,9 +74,8 @@ if ($Uninstall) {
 }
 
 if ([string]::IsNullOrWhiteSpace($DomesticInterface) -or [string]::IsNullOrWhiteSpace($OverseasInterface) -or $DomesticInterface -eq $OverseasInterface) { throw 'Supply two distinct adapter names.' }
-foreach ($name in @($DomesticInterface, $OverseasInterface)) {
-    if (@(Get-NetAdapter | Where-Object Name -eq $name).Count -ne 1) { throw "Choose an existing adapter by its exact name: $name" }
-}
+# A removable campus adapter may be absent throughout Wi-Fi fallback.
+if (@(Get-NetAdapter | Where-Object Name -eq $OverseasInterface).Count -ne 1) { throw "Choose an existing overseas adapter by its exact name: $OverseasInterface" }
 $node = Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1
 $nodePath = $node.Source
 $source = Join-Path $PSScriptRoot 'watch-fallback.cjs'
@@ -120,12 +128,54 @@ Copy-Item -LiteralPath $source -Destination $watcherFile -Force
 $nodeLiteral = $nodePath.Replace("'", "''")
 $argsLiteral = ('"' + $watcherFile + '" --config "' + $configFile + '"').Replace("'", "''")
 $stopLiteral = $stopFile.Replace("'", "''")
+$stderrLiteral = (Join-Path $target 'watcher-stderr.log').Replace("'", "''")
+$supervisorLogLiteral = (Join-Path $target 'supervisor.log').Replace("'", "''")
+$configIdentity = $configFile.ToUpperInvariant()
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $mutexKey = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($configIdentity)))).Replace('-', '') }
+finally { $sha.Dispose() }
 $launcher = @"
 `$ErrorActionPreference = 'Stop'
 `$nodePath = '$nodeLiteral'
-if (Test-Path -LiteralPath '$stopLiteral') { exit 0 }
-if (-not (Test-Path -LiteralPath `$nodePath -PathType Leaf)) { throw 'Install Node.js and rerun Install-AutoFallback.ps1 -Install.' }
-Start-Process -FilePath `$nodePath -WindowStyle Hidden -ArgumentList '$argsLiteral'
+`$stopFile = '$stopLiteral'
+`$stderrFile = '$stderrLiteral'
+`$supervisorLog = '$supervisorLogLiteral'
+function Write-SupervisorEvent(`$eventRecord) {
+    try {
+        if ((Test-Path -LiteralPath `$supervisorLog) -and (Get-Item -LiteralPath `$supervisorLog).Length -gt 262144) {
+            [IO.File]::Copy(`$supervisorLog, `$supervisorLog + '.last', `$true)
+            [IO.File]::WriteAllText(`$supervisorLog, '')
+        }
+        [IO.File]::AppendAllText(`$supervisorLog, ((`$eventRecord | ConvertTo-Json -Compress) + [Environment]::NewLine))
+    } catch { }
+}
+`$mutex = New-Object Threading.Mutex(`$false, 'Local\ClashDualNicSupervisor-$mutexKey')
+`$owned = `$false
+try {
+    try { `$owned = `$mutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { `$owned = `$true }
+    if (-not `$owned) { return }
+    while (-not (Test-Path -LiteralPath `$stopFile)) {
+        try {
+            if ((Test-Path -LiteralPath `$stderrFile) -and (Get-Item -LiteralPath `$stderrFile).Length -gt 262144) {
+                [IO.File]::Copy(`$stderrFile, `$stderrFile + '.last', `$true)
+                [IO.File]::WriteAllText(`$stderrFile, '')
+            }
+            `$child = Start-Process -FilePath `$nodePath -WindowStyle Hidden -ArgumentList '$argsLiteral' -RedirectStandardError `$stderrFile -Wait -PassThru
+            Write-SupervisorEvent ([ordered]@{ occurredAt = [DateTime]::UtcNow.ToString('o'); event = 'child-exited'; childPid = `$child.Id; exitCode = `$child.ExitCode })
+        } catch {
+            Write-SupervisorEvent ([ordered]@{ occurredAt = [DateTime]::UtcNow.ToString('o'); event = 'start-failed'; errorType = `$_.Exception.GetType().FullName })
+            try { [IO.File]::AppendAllText(`$stderrFile, ([DateTime]::UtcNow.ToString('o') + ' ' + `$_.Exception.Message + [Environment]::NewLine)) } catch { }
+        }
+        # Poll the cooperative stop sentinel throughout the restart delay.
+        for (`$retry = 0; `$retry -lt 10 -and -not (Test-Path -LiteralPath `$stopFile); `$retry++) {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+} finally {
+    if (`$owned) { `$mutex.ReleaseMutex() }
+    `$mutex.Dispose()
+}
 "@
 [IO.File]::WriteAllText($launcherFile, $launcher, (New-Object Text.UTF8Encoding($true)))
 if (-not $Install) { Write-Output "Generated preview: $configFile"; return }
@@ -137,6 +187,6 @@ Save-Json $manifestPath $manifest
 if (Test-Path -LiteralPath $stopFile) { Remove-Item -LiteralPath $stopFile }
 if (-not (Test-Path -LiteralPath $registryPath)) { New-Item -Path $registryPath | Out-Null }
 New-ItemProperty -LiteralPath $registryPath -Name $registryName -Value $ownedStartupValue -PropertyType String -Force | Out-Null
-Start-Process -FilePath $nodePath -WindowStyle Hidden -ArgumentList ('"' + $watcherFile + '" --config "' + $configFile + '"')
+Start-Process -FilePath $powerShellPath -WindowStyle Hidden -ArgumentList ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $launcherFile + '"')
 Write-Output "Auto fallback installed and started. Config: $configFile"
 Write-Output "Restore command: & '$($PSCommandPath.Replace("'", "''"))' -Uninstall -StateDirectory '$($state.Replace("'", "''"))'"

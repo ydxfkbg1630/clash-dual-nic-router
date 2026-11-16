@@ -149,3 +149,57 @@ test('logs retain the previous generation when 256 KiB is reached', () => {
     assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).status, 'wifi');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('state rename failures remove only this process temporary file and preserve the last state', () => {
+  const { writeState } = require('../scripts/watch-fallback.cjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fallback-io-test-'));
+  const file = path.join(dir, 'state.json');
+  const otherTemporary = `${file}.other.tmp`;
+  try {
+    fs.writeFileSync(file, '{"previous":true}');
+    fs.writeFileSync(otherTemporary, 'preserve');
+    const io = Object.create(fs);
+    io.renameSync = () => { throw Object.assign(new Error('private path'), { code: 'EBUSY' }); };
+    assert.throws(() => writeState(file, createState(), io), { code: 'EBUSY' });
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { previous: true });
+    assert.equal(fs.existsSync(`${file}.${process.pid}.tmp`), false);
+    assert.equal(fs.readFileSync(otherTemporary, 'utf8'), 'preserve');
+    writeState(file, { status: 'wifi' });
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).status, 'wifi');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('state and log failures keep reporting alive, retry, and bound fallback output', () => {
+  const { createReporter } = require('../scripts/watch-fallback.cjs');
+  let failState = true;
+  let failLog = true;
+  const writes = [];
+  const logs = [];
+  const fallback = [];
+  const report = createReporter(config, {
+    writeState: (file, state) => {
+      if (failState) throw Object.assign(new Error('private path'), { code: 'EACCES' });
+      writes.push(state);
+    },
+    log: event => {
+      if (failLog) throw Object.assign(new Error('private log path'), { code: 'ENOSPC' });
+      logs.push(event);
+    },
+    fallback: line => fallback.push(line),
+    now: () => 1000,
+  });
+  const state = { ...createState(), status: 'wifi', target: 'Wi-Fi', appliedState: 'Wi-Fi' };
+  for (let i = 0; i < 50; i++) report(state);
+  assert.equal(fallback.length, 1);
+  assert.match(fallback[0], /EACCES/);
+  assert.match(fallback[0], /ENOSPC/);
+  assert.doesNotMatch(fallback[0], /private/);
+  failState = false;
+  report(state);
+  assert.deepEqual(writes.at(-1).ioErrors, ['Log write failed (ENOSPC)']);
+  failLog = false;
+  report(state);
+  assert.deepEqual(writes.at(-1).ioErrors, []);
+  assert.equal(logs.length, 1);
+  assert.deepEqual(logs[0].ioErrors, []);
+});

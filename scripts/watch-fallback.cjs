@@ -94,12 +94,14 @@ $names = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${names}')
 $data = @(foreach ($name in $names) {
   $nic = Get-NetAdapter | Where-Object { $_.Name -ceq $name } | Select-Object -First 1
   $ready = $false
+  $ips = @()
+  $routes = @()
   if ($nic -and $nic.Status -eq 'Up') {
     $ips = @(Get-NetIPAddress -InterfaceIndex $nic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notmatch '^(169\\.254\\.|127\\.|0\\.)' })
     $routes = @(Get-NetRoute -InterfaceIndex $nic.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -ne '0.0.0.0' })
     $ready = $ips.Count -gt 0 -and $routes.Count -gt 0
   }
-  [pscustomobject]@{Name=$name;ready=[bool]$ready}
+  [pscustomobject]@{Name=$name;ready=[bool]$ready;status=$(if ($nic) { [string]$nic.Status } else { 'Missing' });interfaceIndex=$(if ($nic) { [int]$nic.ifIndex } else { $null });ipv4=@($ips | ForEach-Object { $_.IPAddress });gateways=@($routes | ForEach-Object { $_.NextHop })}
 })
 ConvertTo-Json -InputObject $data -Compress`;
   const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
@@ -133,14 +135,55 @@ function createApi(config) {
   });
 }
 
-function writeState(file, state) {
+function writeState(file, state, io = fs) {
   if (!file) return;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  io.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify({ ...state, desiredInterface: state.target,
-    appliedInterface: state.appliedState, readyCount: state.recoveryCount,
-    updatedAt: new Date().toISOString(), pid: process.pid }, null, 2) + '\n', 'utf8');
-  fs.renameSync(temporary, file);
+  try {
+    io.writeFileSync(temporary, JSON.stringify({ ...state, desiredInterface: state.target,
+      appliedInterface: state.appliedState, readyCount: state.recoveryCount,
+      updatedAt: new Date().toISOString(), pid: process.pid }, null, 2) + '\n', 'utf8');
+    io.renameSync(temporary, file);
+  } finally {
+    // Only this process's staging file is owned here. Cleanup is best effort;
+    // the original write error is what the reporter needs to diagnose.
+    try { io.unlinkSync(temporary); } catch {}
+  }
+}
+
+function errorCategory(error) {
+  return typeof error?.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : 'RUNTIME_ERROR';
+}
+
+function createReporter(config, dependencies = {}) {
+  const save = dependencies.writeState || writeState;
+  const log = dependencies.log || createLogger(config.logFile);
+  const fallback = dependencies.fallback || (line => process.stderr.write(line));
+  const now = dependencies.now || Date.now;
+  let lastEvent = '';
+  let lastFallbackAt = -Infinity;
+  return state => {
+    const reported = { ...state, ioErrors: [] };
+    try { save(config.stateFile, reported); }
+    catch (error) { reported.ioErrors.push(`State write failed (${errorCategory(error)})`); }
+    const event = { status: state.status, target: state.target, appliedState: state.appliedState,
+      error: state.error, ioErrors: [...reported.ioErrors] };
+    const serialized = JSON.stringify(event);
+    if (serialized !== lastEvent || state.changed) {
+      try { log(event); lastEvent = serialized; }
+      catch (error) { reported.ioErrors.push(`Log write failed (${errorCategory(error)})`); }
+    }
+    // Persist log failures too, retaining the independent routing/API error.
+    if (reported.ioErrors.length) {
+      try { save(config.stateFile, reported); } catch {}
+      const timestamp = now();
+      if (timestamp - lastFallbackAt >= 60000) {
+        lastFallbackAt = timestamp;
+        try { fallback(JSON.stringify({ status: 'diagnostic-io-error', ioErrors: reported.ioErrors }) + '\n'); } catch {}
+      }
+    }
+    return reported;
+  };
 }
 
 function createLogger(file) {
@@ -182,9 +225,9 @@ async function main(args = process.argv.slice(2)) {
     throw new Error('Watcher lock unavailable');
   }
   const log = createLogger(config.logFile);
+  const report = createReporter(config, { log });
   const api = createApi(config);
   let state = createState();
-  let lastEvent = '';
   let stopped = false;
   const stop = () => { stopped = true; };
   process.on('SIGINT', stop);
@@ -196,17 +239,16 @@ async function main(args = process.argv.slice(2)) {
         const adapters = await queryAdapters(config);
         if (stopped || shouldStop()) break;
         state = await tick(state, adapters, config, api);
+        state.adapters = adapters;
       } catch {
         state = { ...state, recoveryCount: 0, changed: false, error: 'Adapter query failed' };
       }
-      writeState(config.stateFile, state);
-      const event = JSON.stringify({ status: state.status, target: state.target, appliedState: state.appliedState, error: state.error });
-      if (event !== lastEvent || state.changed) { log(JSON.parse(event)); lastEvent = event; }
+      report(state);
       if (args.includes('--once')) break;
       const end = Date.now() + config.intervalSeconds * 1000;
       while (!stopped && !shouldStop() && Date.now() < end) await new Promise(resolve => setTimeout(resolve, Math.min(500, end - Date.now())));
     } while (!stopped);
-    log({ status: 'stopped' });
+    try { log({ status: 'stopped' }); } catch {}
   } finally {
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
@@ -214,5 +256,5 @@ async function main(args = process.argv.slice(2)) {
   }
 }
 
-module.exports = { normalizeConfig, createState, decideState, tick, queryAdapters, createApi, createLogger, main };
-if (require.main === module) main().catch(() => { process.stderr.write('Fallback watcher stopped: configuration or runtime failure.\n'); process.exitCode = 1; });
+module.exports = { normalizeConfig, createState, decideState, tick, queryAdapters, createApi, createLogger, writeState, createReporter, main };
+if (require.main === module) main().catch(error => { process.stderr.write(`Fallback watcher stopped (${errorCategory(error)}).\n`); process.exitCode = 1; });
