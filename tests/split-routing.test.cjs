@@ -43,11 +43,101 @@ test('routes domestic traffic through Ethernet and proxy sockets through Wi-Fi w
   for (const rule of ['IP-CIDR6,::1/128,DIRECT,no-resolve', 'IP-CIDR6,fc00::/7,DIRECT,no-resolve', 'IP-CIDR6,fe80::/10,DIRECT,no-resolve']) assert.ok(out.rules.includes(rule));
 });
 
-test('preferred local proxy comes first and missing or non-proxy preferences fail', () => {
+test('preferred local proxy comes first and explicit error policy validates its name', () => {
   assert.deepEqual(transform(fixture(), { preferredProxy: 'Example B' })['proxy-groups'].at(-1).proxies, ['Example B', 'Example A']);
   for (const preferredProxy of ['Missing', 'Custom direct', 'Existing', 'DIRECT']) {
-    assert.throws(() => transform(fixture(), { preferredProxy }), /preferredProxy/);
+    assert.throws(() => transform(fixture(), { preferredProxy, missingPreferredProxy: 'error' }), /preferredProxy/);
   }
+});
+
+test('a changed subscription falls back to its real proxies and retains every strict Wi-Fi binding', () => {
+  const input = fixture();
+  input.proxies = Array.from({ length: 46 }, (_, index) => ({ name: 'New node ' + index, type: 'ss', server: 'relay.example', port: 443 }));
+  input.proxies.push({ name: 'Custom direct', type: 'direct' });
+  input['proxy-groups'] = [];
+  const before = structuredClone(input);
+  for (const missingPreferredProxy of [undefined, 'fallback']) {
+    const options = { ruleMode: 'strict', preferredProxy: 'Old subscription node', missingPreferredProxy };
+    const out = transform(input, options);
+    assert.deepEqual(input, before);
+    assert.equal(out.proxies.slice(0, 46).every((proxy) => proxy['interface-name'] === 'Wi-Fi' && proxy['ip-version'] === 'ipv4'), true);
+    const group = out['proxy-groups'].at(-1);
+    assert.deepEqual(group.proxies, input.proxies.slice(0, 46).map((proxy) => proxy.name));
+    assert.equal(group.proxies.includes('DIRECT'), false);
+    assert.equal(group.proxies.includes('Custom direct'), false);
+    assert.equal(out['interface-name'], 'Ethernet');
+    for (const domain of ['microsoft.com', 'microsoftonline.com', 'live.com', 'bing.com', 'apple.com', 'icloud.com']) {
+      assert.ok(out.rules.includes('DOMAIN-SUFFIX,' + domain + ',' + group.name));
+    }
+    assert.equal(out.rules.at(-1), 'MATCH,' + group.name);
+    assert.deepEqual(out['x-dual-nic-router-status'], { preferredProxyFallback: true });
+    assert.deepEqual(transform(out, options), out);
+  }
+});
+
+test('stale preferences support provider-only subscriptions and expose only fallback status', () => {
+  const input = { 'proxy-providers': { Remote: { type: 'http', url: 'https://subscription.example/proxies.yaml' } } };
+  const options = { ruleMode: 'strict', preferredProxy: 'Old private node name' };
+  const out = transform(input, options);
+  const group = out['proxy-groups'].at(-1);
+  assert.deepEqual(group.use, ['Remote']);
+  assert.equal(Object.hasOwn(group, 'proxies'), false);
+  assert.equal(out['proxy-providers'].Remote.override['interface-name'], 'Wi-Fi');
+  assert.equal(out['proxy-providers'].Remote.override['ip-version'], 'ipv4');
+  assert.deepEqual(out['x-dual-nic-router-status'], { preferredProxyFallback: true });
+  assert.equal(JSON.stringify(out['x-dual-nic-router-status']).includes(options.preferredProxy), false);
+  assert.deepEqual(transform(out, options), out);
+  assert.throws(() => transform(input, { ...options, missingPreferredProxy: 'error' }), /preferredProxy/);
+});
+
+test('fallback policy validates spelling, skips direct preferences and clears stale status', () => {
+  for (const missingPreferredProxy of ['fallbak', '', null, true]) {
+    assert.throws(() => transform(fixture(), { missingPreferredProxy }), /missingPreferredProxy/);
+  }
+  for (const preferredProxy of ['Custom direct', 'Existing', 'DIRECT']) {
+    const out = transform(fixture(), { preferredProxy });
+    assert.deepEqual(out['proxy-groups'].at(-1).proxies, ['Example A', 'Example B']);
+    assert.equal(out['x-dual-nic-router-status'].preferredProxyFallback, true);
+  }
+  const stale = transform(fixture(), { preferredProxy: 'Old node' });
+  const current = transform(stale, { preferredProxy: 'Example B' });
+  assert.deepEqual(current['x-dual-nic-router-status'], { preferredProxyFallback: false });
+  assert.deepEqual(current['proxy-groups'].at(-1).proxies, ['Example B', 'Example A']);
+  assert.deepEqual(transform(fixture())['x-dual-nic-router-status'], { preferredProxyFallback: false });
+  assert.throws(() => transform({ proxies: [{ name: 'Local', type: 'direct' }] }, { preferredProxy: 'Old node' }), /real proxy/);
+});
+
+test('overseas selection defaults to manual and adds health checks only for fallback groups', () => {
+  const manual = transform(fixture())['proxy-groups'].at(-1);
+  assert.equal(manual.type, 'select');
+  for (const key of ['url', 'interval', 'timeout', 'lazy']) assert.equal(Object.hasOwn(manual, key), false);
+  for (const overseasGroupType of ['url-test', '', null, true]) {
+    assert.throws(() => transform(fixture(), { overseasGroupType }), /overseasGroupType/);
+  }
+  const input = fixture();
+  input['proxy-providers'] = { Remote: { type: 'http', url: 'https://subscription.example/proxies.yaml' } };
+  const options = { ruleMode: 'strict', overseasGroupType: 'fallback', preferredProxy: 'Example B' };
+  const out = transform(input, options);
+  const group = out['proxy-groups'].at(-1);
+  assert.equal(group.type, 'fallback');
+  assert.equal(group.url, 'https://www.gstatic.com/generate_204');
+  assert.equal(group.interval, 60);
+  assert.equal(group.timeout, 5000);
+  assert.equal(group.lazy, false);
+  assert.deepEqual(group.proxies, ['Example B', 'Example A']);
+  assert.deepEqual(group.use, ['Remote']);
+  assert.equal(group.proxies.includes('DIRECT'), false);
+  assert.equal(out.proxies[0]['interface-name'], 'Wi-Fi');
+  assert.equal(out['proxy-providers'].Remote.override['interface-name'], 'Wi-Fi');
+  assert.deepEqual(transform(out, options), out);
+  const changed = transform(input, { ...options, preferredProxy: 'Old subscription node' });
+  assert.deepEqual(changed['proxy-groups'].at(-1).proxies, ['Example A', 'Example B']);
+  assert.equal(changed['proxy-groups'].at(-1).type, 'fallback');
+  assert.equal(changed['x-dual-nic-router-status'].preferredProxyFallback, true);
+  const providerOnly = transform({ 'proxy-providers': input['proxy-providers'] }, options)['proxy-groups'].at(-1);
+  assert.equal(providerOnly.type, 'fallback');
+  assert.deepEqual(providerOnly.use, ['Remote']);
+  assert.equal(Object.hasOwn(providerOnly, 'proxies'), false);
 });
 
 test('preserves DNS and TUN options while enabling required routing settings', () => {

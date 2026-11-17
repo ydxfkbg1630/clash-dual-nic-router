@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.2
+
+- Keep routing enhancement active when a preferred node disappears after switching subscriptions.
+- Add opt-in health-checked fallback groups for overseas nodes, alongside manual selection.
+- Document configuration reload and node health behavior.
+
 ## 1.3.1
 
 - Supervise the fallback worker and restart it after unexpected exits, with local exit diagnostics.

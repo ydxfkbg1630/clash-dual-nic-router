@@ -5,6 +5,8 @@ const OPTIONS = {
   domesticInterface: 'Ethernet',
   overseasInterface: 'Wi-Fi',
   preferredProxy: '',
+  missingPreferredProxy: 'fallback',
+  overseasGroupType: 'select',
   tun: true,
   ruleMode: 'preserve',
   proxyIpVersion: 'ipv4',
@@ -33,6 +35,11 @@ function main(config) {
   if (OPTIONS.domesticInterface === OPTIONS.overseasInterface) fail('Choose distinct domesticInterface and overseasInterface adapters.');
   if (typeof OPTIONS.tun !== 'boolean') fail('Set tun to true or false.');
   if (typeof OPTIONS.preferredProxy !== 'string') fail('Set preferredProxy to a local proxy name or an empty string.');
+  // Older installers may supply only the original options object.
+  const missingPreferredProxy = OPTIONS.missingPreferredProxy === undefined ? 'fallback' : OPTIONS.missingPreferredProxy;
+  if (!['fallback', 'error'].includes(missingPreferredProxy)) fail('Set missingPreferredProxy to fallback or error.');
+  const overseasGroupType = OPTIONS.overseasGroupType === undefined ? 'select' : OPTIONS.overseasGroupType;
+  if (!['select', 'fallback'].includes(overseasGroupType)) fail('Set overseasGroupType to select or fallback.');
   if (!Array.isArray(OPTIONS.extraDirectCidrs)) fail('Set extraDirectCidrs to an array of CIDR strings.');
   if (!Array.isArray(OPTIONS.extraDirectDomains)) fail('Set extraDirectDomains to an array of domain names.');
   if (!['preserve', 'replace', 'strict'].includes(OPTIONS.ruleMode)) fail('Set ruleMode to preserve, replace, or strict.');
@@ -90,12 +97,20 @@ function main(config) {
     provider['exclude-type'] = [...new Set(String(provider['exclude-type'] || '').split('|').filter(Boolean).concat([...reservedTypes]))].join('|');
   }
   if (!candidates.length && !providerNames.length) fail('Add at least one real proxy or proxy-provider to the configuration.');
+  let preferredProxyFallback = false;
   if (OPTIONS.preferredProxy) {
     const index = candidates.indexOf(OPTIONS.preferredProxy);
-    if (index < 0) fail('preferredProxy: choose a real proxy from the top-level proxies list; use an empty string for provider-only subscriptions.');
-    candidates.splice(index, 1);
-    candidates.unshift(OPTIONS.preferredProxy);
+    if (index < 0) {
+      if (missingPreferredProxy === 'error') fail('preferredProxy: choose a real proxy from the top-level proxies list; use an empty string for provider-only subscriptions.');
+      // Subscription changes keep the full routing enhancement active. Only
+      // real remote proxies and provider candidates enter the overseas group.
+      preferredProxyFallback = true;
+    } else {
+      candidates.splice(index, 1);
+      candidates.unshift(OPTIONS.preferredProxy);
+    }
   }
+  out['x-dual-nic-router-status'] = { preferredProxyFallback };
 
   // A metadata key identifies our own group across repeated transformations.
   const marker = 'x-dual-nic-router-group';
@@ -104,7 +119,10 @@ function main(config) {
   const names = new Set(proxies.concat(existing).map((item) => item.name));
   let groupName = 'Overseas via Wi-Fi';
   for (let suffix = 2; names.has(groupName); suffix++) groupName = 'Overseas via Wi-Fi (' + suffix + ')';
-  const group = { name: groupName, type: 'select', 'exclude-type': 'Direct|Reject|RejectDrop|Pass|Compatible' };
+  const group = { name: groupName, type: overseasGroupType, 'exclude-type': 'Direct|Reject|RejectDrop|Pass|Compatible' };
+  if (overseasGroupType === 'fallback') Object.assign(group, {
+    url: 'https://www.gstatic.com/generate_204', interval: 60, timeout: 5000, lazy: false,
+  });
   if (candidates.length) group.proxies = candidates;
   if (providerNames.length) group.use = providerNames;
   out['proxy-groups'] = existing.concat([group]);

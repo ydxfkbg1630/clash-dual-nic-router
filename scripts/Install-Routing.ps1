@@ -3,6 +3,8 @@ param(
     [string]$DomesticInterface,
     [string]$OverseasInterface,
     [string]$PreferredProxy = '',
+    [ValidateSet('fallback', 'error')][string]$MissingPreferredProxy = 'fallback',
+    [ValidateSet('select', 'fallback')][string]$OverseasGroupType = 'select',
     [ValidateSet('preserve', 'replace', 'strict')][string]$RuleMode = 'preserve',
     [ValidateSet('ipv4', 'dual', 'ipv6', 'ipv4-prefer', 'ipv6-prefer')][string]$ProxyIpVersion = 'ipv4',
     [string[]]$ExtraDirectDomains = @(),
@@ -53,6 +55,8 @@ $options = [ordered]@{
     domesticInterface=$DomesticInterface
     overseasInterface=$OverseasInterface
     preferredProxy=$PreferredProxy
+    missingPreferredProxy=$MissingPreferredProxy
+    overseasGroupType=$OverseasGroupType
     tun=$true
     ruleMode=$RuleMode
     proxyIpVersion=$ProxyIpVersion

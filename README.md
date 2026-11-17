@@ -45,7 +45,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Install-Routing.ps1 `
 
 命令输出生成的 `Script.js` 路径。打开 Clash Verge 的订阅页面，进入**全局扩展脚本**，粘贴生成文件内容并保存。随后选择**规则模式**并开启 **TUN**。在代理页面选择原订阅策略组的节点；当流量使用新增兜底时，在 `Overseas via Wi-Fi` 策略组中选择节点。
 
-要指定新增兜底组的默认节点，追加 `-PreferredProxy '你的节点名称'`；默认采用配置中的首个可用节点。此参数精确匹配本地代理名称，provider 用户可在组中选择订阅节点。保留模式中，原有策略组和原 `MATCH` 的节点选择仍在各自组中设置。
+要指定新增兜底组的默认节点，追加 `-PreferredProxy '你的节点名称'`；默认采用配置中的首个可用节点。此参数匹配本地代理名称；v1.3.2 起，切换订阅后旧名称消失时，自动回退到新订阅的节点，整套增强继续生效。需要严格检查名称可设置 `-MissingPreferredProxy error`。provider 用户可在组中选择订阅节点。保留模式中，原有策略组和原 `MATCH` 的节点选择仍在各自组中设置。
 
 ### 文件安装与备份
 
@@ -80,6 +80,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Restore-Routing.ps1 `
 | `domesticInterface` | `Ethernet` | 国内直连网卡，填 Windows 中的实际名称 |
 | `overseasInterface` | `Wi-Fi` | 代理连接使用的网卡 |
 | `preferredProxy` | 空字符串 | 新增兜底组的默认节点；空值使用首个本地节点 |
+| `missingPreferredProxy` | `fallback` | 首选节点随订阅消失时自动回退；`error` 提供名称校验 |
+| `overseasGroupType` | `select` | 手动选择；`fallback` 定期探测并选择可用节点 |
 | `tun` | `true` | 生成配置中的 TUN 开关；客户端开关同步设置 |
 | `ruleMode` | `preserve` | `preserve` 保留订阅；`replace` 旧版地域分流；`strict` 严格分流与 TUN/DNS/IPv4 设置 |
 | `proxyIpVersion` | `ipv4` | 代理服务器连接使用 IPv4；支持 `dual`、`ipv6`、`ipv4-prefer`、`ipv6-prefer` |
@@ -225,3 +227,9 @@ Clash Verge Rev、Mihomo 和 GeoSite / GeoIP 数据由各自项目维护，许�
 A configurable Clash Verge Rev enhancement script for Windows dual-NIC routing: China traffic uses Ethernet directly, while overseas traffic reaches existing proxy nodes over Wi-Fi. Set adapter names in `OPTIONS`, save the script in Clash Verge's global script editor, select Rule mode, and enable TUN. PowerShell helpers generate/install the script and restore backups. Version 1.1 preserves existing rules by default, including ad blocking, application policies, and the original MATCH. Explicit policies take precedence over geographic fallback. Version 1.2 adds `ruleMode: "strict"` for service-domain-first routing, strict TUN, DNS routing, IPv4 transports and sniffing. A preview/apply/restore PowerShell helper handles adapter IPv6 state using GUID-verified backups. Reconnect existing application sessions and verify physical source addresses. `replace` retains the older country-only rule replacement. Proxy transports default to IPv4; domestic IPv6 remains inherited. Campus domains receive real-IP DNS exceptions, and explicit campus/DNS/gateway CIDRs bypass TUN. Node credentials remain in the local Clash configuration. Apache-2.0 licensed.
 
 Version 1.3 adds an optional Windows background watcher: domestic DIRECT uses Wi-Fi while Ethernet is disconnected and returns to Ethernet after three ready samples. Existing overseas proxy bindings remain on Wi-Fi. The watcher uses the local Mihomo named pipe, validates the applied interface, and logs state changes. Install/uninstall commands manage a per-user startup entry.
+
+### 订阅切换与节点故障恢复（v1.3.2）
+
+全局扩展脚本在每次订阅配置生成时运行。切换订阅后，旧首选节点名称可能消失；默认 `missingPreferredProxy: 'fallback'` 会使用当前订阅节点，继续生成接口绑定与分流规则。`x-dual-nic-router-status.preferredProxyFallback` 记录该次回退。
+
+启用节点健康故障转移时，安装命令添加 `-OverseasGroupType fallback`，或在 OPTIONS 设置 `overseasGroupType: 'fallback'`。代理组按候选顺序选择可用节点，每 60 秒探测 `https://www.gstatic.com/generate_204`，探测超时 5 秒。订阅中的统计条目、失效节点会由健康检测跳过；节点健康与目标网站可用性仍需实际访问验证。保留模式原有订阅组继续按原策略工作；严格模式国外流量使用新增故障转移组。

@@ -105,7 +105,7 @@ Write-Output 'PASS: discovery, explicit portal routes, defaults, policy override
 Write-Output "Temporary test files: $root"
 
 $strictState = Join-Path $root 'strict'
-& $install -DomesticInterface 'Test Ethernet' -OverseasInterface 'Test Wi-Fi' -StateDirectory $strictState -SkipNetworkDiscovery -RuleMode strict | Out-Null
+& $install -DomesticInterface 'Test Ethernet' -OverseasInterface 'Test Wi-Fi' -StateDirectory $strictState -SkipNetworkDiscovery -RuleMode strict -PreferredProxy 'Retired node' -OverseasGroupType fallback | Out-Null
 $strictFile = Get-ChildItem -LiteralPath $strictState -Filter Script.js -Recurse | Select-Object -First 1
 Assert ((Read-GeneratedOptions $strictFile.FullName).ruleMode -eq 'strict') 'Strict mode was lost.'
 @'
@@ -114,6 +114,8 @@ vm.runInThisContext(fs.readFileSync(process.argv[2],'utf8'));
 const output=main({proxies:[{name:'Example',type:'ss',server:'192.0.2.1',port:443}],rules:['MATCH,DIRECT']});
 assert.equal(output.tun['strict-route'],true);
 assert.equal(output.ipv6,false);
+assert.equal(output['proxy-groups'].at(-1).type,'fallback');
+assert.equal(output['x-dual-nic-router-status'].preferredProxyFallback,true);
 assert(output.rules.some(r=>r.startsWith('GEOSITE,geolocation-!cn,')));
 assert(!output.rules.includes('MATCH,DIRECT'));
 '@ | & node - $strictFile.FullName
